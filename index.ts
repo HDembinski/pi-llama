@@ -195,6 +195,18 @@ export default async function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Non-interactive hosts (RPC mode, custom UIs) have no /model input to
+	// hook, so they can't trigger a re-query on their own. This command is
+	// the explicit equivalent; the notify tells such hosts the catalog has
+	// been re-queried so they can re-request it.
+	pi.registerCommand("llama-refresh", {
+		description: "Re-query the llama.cpp server and refresh the model catalog",
+		handler: async (_args, ctx) => {
+			await refreshProvider();
+			ctx.ui.notify(`llama.cpp catalog re-queried — ${currentModels.length} model(s) available`);
+		},
+	});
+
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
 
