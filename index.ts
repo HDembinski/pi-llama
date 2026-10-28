@@ -15,7 +15,7 @@ import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
 // Fallback for /v1/models entries missing meta.n_ctx.
-const DEFAULT_CONTEXT_WINDOW = 8192;
+const DEFAULT_CONTEXT_WINDOW = 32768;
 // llama.cpp has no output-token cap (no endpoint reports one; generation is only
 // bounded by the context window), so use Pi's own default for models that omit
 // maxTokens (see model-registry.ts parseModels).
@@ -392,10 +392,10 @@ export default async function (pi: ExtensionAPI) {
 							if (sseEvent.data.exit_code && sseEvent.data.exit_code !== 0) {
 								ctx?.ui.setWidget(PROVIDER_ID, [
 									ctx?.ui.theme.fg("error", "[llama.cpp] ") +
-										ctx?.ui.theme.fg(
-											"text",
-											`${displayName}:  failed (exit ${sseEvent.data.exit_code})`,
-										),
+									ctx?.ui.theme.fg(
+										"text",
+										`${displayName}:  failed (exit ${sseEvent.data.exit_code})`,
+									),
 								]);
 								sseAbortController?.abort();
 								return;
@@ -558,10 +558,10 @@ export default async function (pi: ExtensionAPI) {
 				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
 				ctx.ui.setWidget(PROVIDER_ID, [
 					prefix +
-						ctx.ui.theme.fg(
-							"text",
-							` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
-						),
+					ctx.ui.theme.fg(
+						"text",
+						` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
+					),
 				]);
 				clearFooterStatusLater();
 			}
