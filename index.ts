@@ -51,6 +51,28 @@ export function buildMagicPacket(mac: string): Buffer | null {
 	return packet;
 }
 
+export async function sendMagicPacket(packet: Buffer): Promise<void> {
+	const socket = dgram.createSocket("udp4");
+	try {
+		await new Promise<void>((resolve, reject) => {
+			socket.once("error", reject);
+			socket.bind(0, () => {
+				try {
+					socket.setBroadcast(true);
+					socket.send(packet, WAKE_PORT, WAKE_BROADCAST, (error) => {
+						if (error) reject(error);
+						else resolve();
+					});
+				} catch (error) {
+					reject(error);
+				}
+			});
+		});
+	} finally {
+		socket.close();
+	}
+}
+
 // TCP-connect probe: a refused or timing-out connection means the server (and
 // possibly the machine) is down.
 function isServerReachable(baseUrl: string): Promise<boolean> {
@@ -269,13 +291,8 @@ export default async function (pi: ExtensionAPI) {
 
 	let wakeInFlight: Promise<void> | null = null;
 
-	// If the server is down, broadcast the magic packet and, when maxWaitMs > 0,
-	// block until it answers so a request sent right away does not fail while
-	// the box is still booting. Concurrent calls share one wake attempt.
-	async function wakeServerIfAsleep(
-		ctx: ExtensionCtx | undefined,
-		maxWaitMs: number,
-	): Promise<void> {
+	// Selection starts the full attempt; a turn joins it and waits for boot.
+	async function wakeServerIfAsleep(ctx: ExtensionCtx | undefined): Promise<void> {
 		if (!wakePacket) {
 			return;
 		}
@@ -286,14 +303,12 @@ export default async function (pi: ExtensionAPI) {
 			if (await isServerReachable(baseUrl)) {
 				return;
 			}
-			const socket = dgram.createSocket("udp4");
-			socket.setBroadcast(true);
-			socket.send(wakePacket, WAKE_PORT, WAKE_BROADCAST, () => socket.close());
+			await sendMagicPacket(wakePacket);
 			notify(
 				ctx,
-				`[llama-cpp] server unreachable — sent wake-on-LAN packet${maxWaitMs > 0 ? ", waiting for it to boot" : ""}`,
+				"[llama-cpp] server unreachable — sent wake-on-LAN packet, waiting for it to boot",
 			);
-			const deadline = Date.now() + maxWaitMs;
+			const deadline = Date.now() + WAKE_MAX_WAIT_MS;
 			while (Date.now() < deadline) {
 				await sleep(WAKE_POLL_INTERVAL_MS);
 				if (await isServerReachable(baseUrl)) {
@@ -301,16 +316,14 @@ export default async function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			if (maxWaitMs > 0) {
-				notify(
-					ctx,
-					`[llama-cpp] server still not reachable after ${Math.round(maxWaitMs / 1000)}s`,
-					"warning",
-				);
-			}
-		})().finally(() => {
-			wakeInFlight = null;
-		});
+			notify(ctx, "[llama-cpp] server still not reachable after 120s", "warning");
+		})()
+			.catch((error: unknown) => {
+				notify(ctx, `[llama-cpp] wake failed: ${String(error)}`, "error");
+			})
+			.finally(() => {
+				wakeInFlight = null;
+			});
 		return wakeInFlight;
 	}
 
@@ -508,10 +521,10 @@ export default async function (pi: ExtensionAPI) {
 							if (sseEvent.data.exit_code && sseEvent.data.exit_code !== 0) {
 								ctx?.ui.setWidget(PROVIDER_ID, [
 									ctx?.ui.theme.fg("error", "[llama.cpp] ") +
-									ctx?.ui.theme.fg(
-										"text",
-										`${displayName}:  failed (exit ${sseEvent.data.exit_code})`,
-									),
+										ctx?.ui.theme.fg(
+											"text",
+											`${displayName}:  failed (exit ${sseEvent.data.exit_code})`,
+										),
 								]);
 								sseAbortController?.abort();
 								return;
@@ -650,7 +663,10 @@ export default async function (pi: ExtensionAPI) {
 					// 500 during autoload is expected when the server cancels a load to start
 					// another model. Suppress the notification for that case.
 					if (!(shouldAutoload && response.status === 500)) {
-						ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
+						ctx?.ui.notify(
+							`[llama-cpp] /props for ${modelId} returned ${response.status}`,
+							"error",
+						);
 					}
 					return;
 				}
@@ -694,10 +710,10 @@ export default async function (pi: ExtensionAPI) {
 				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
 				ctx.ui.setWidget(PROVIDER_ID, [
 					prefix +
-					ctx.ui.theme.fg(
-						"text",
-						` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
-					),
+						ctx.ui.theme.fg(
+							"text",
+							` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
+						),
 				]);
 				clearFooterStatusLater();
 			}
@@ -744,7 +760,7 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 		// Start the wake early: a sleeping box needs time to boot.
-		void wakeServerIfAsleep(ctx, 0);
+		void wakeServerIfAsleep(ctx);
 		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
 	});
 
@@ -754,7 +770,7 @@ export default async function (pi: ExtensionAPI) {
 			if (ctx.model?.provider === PROVIDER_ID) {
 				// Block until the server answers so the request does not fail
 				// while the box is still booting.
-				await wakeServerIfAsleep(ctx, WAKE_MAX_WAIT_MS);
+				await wakeServerIfAsleep(ctx);
 				await discoverModelMetadata(ctx.model.id, ctx, true, PROPS_TIMEOUT_MS, ctx.model);
 			}
 		} catch (error) {
