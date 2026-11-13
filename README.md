@@ -1,5 +1,9 @@
 # pi-llama
 
+> [!TIP]
+> **llama.cpp support is now built into [Pi](https://pi.dev).**
+> This extension is no longer needed. Follow the [built-in llama.cpp setup guide](https://pi.dev/docs/latest/llama-cpp) to get started.
+
 llama.cpp Pi extension. Auto-discovers models from a running llama.cpp server and
 registers them as the `llama-cpp` provider in [pi](https://pi.dev).
 
@@ -36,7 +40,7 @@ developing.
 
 This extension supports the following environment variables:
 
-- LLAMA_BASE_URL (Default: `http://localhost:8080/v1`)
+- LLAMA_BASE_URL (Default: `http://localhost:9931/v1`)
 - LLAMA_API_KEY (Default: `no-key`)
 
 ## Usage
