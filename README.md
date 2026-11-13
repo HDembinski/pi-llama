@@ -42,6 +42,12 @@ This extension supports the following environment variables:
 
 - LLAMA_BASE_URL (Default: `http://localhost:9931/v1`)
 - LLAMA_API_KEY (Default: `no-key`)
+- LLAMA_WAKE_MAC — MAC address of the machine running the llama.cpp server
+  (e.g. `00:1A:2B:3C:4D:5E`, dashes also accepted). When set, a
+  Wake-on-LAN magic packet (broadcast `255.255.255.255:9`) is sent if the
+  server is unreachable when a llama-cpp model is selected or a turn starts,
+  and the turn waits up to 2 minutes for the server to come back. Unset
+  (default) = feature disabled.
 
 ## Usage
 

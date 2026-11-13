@@ -7,6 +7,8 @@
  * Usage: `pi install github.com/huggingface/pi-llama`
  */
 
+import dgram from "node:dgram";
+import net from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -21,6 +23,55 @@ const DEFAULT_CONTEXT_WINDOW = 32768;
 // maxTokens (see model-registry.ts parseModels).
 const DEFAULT_MAX_TOKENS = 16384;
 const PROPS_TIMEOUT_MS = 120_000;
+
+// Wake-on-LAN: wake the machine running llama-server before a request is sent
+// to it. Only active when LLAMA_WAKE_MAC is set.
+const WAKE_BROADCAST = "255.255.255.255";
+const WAKE_PORT = 9;
+const WAKE_PROBE_TIMEOUT_MS = 1500;
+const WAKE_POLL_INTERVAL_MS = 5000;
+const WAKE_MAX_WAIT_MS = 120_000;
+
+// Magic packet: six 0xff bytes followed by the target MAC repeated 16 times.
+// Accepts ":", "-" or "." separators.
+export function buildMagicPacket(mac: string): Buffer | null {
+	const bytes = mac
+		.replace(/[-.]/g, ":")
+		.split(":")
+		.map((h) => Number.parseInt(h, 16));
+	if (bytes.length !== 6 || bytes.some((b) => Number.isNaN(b) || b > 255)) {
+		return null;
+	}
+	const packet = Buffer.alloc(102);
+	packet.fill(0xff, 0, 6);
+	const macBytes = Buffer.from(bytes);
+	for (let i = 0; i < 16; i++) {
+		macBytes.copy(packet, 6 + i * 6);
+	}
+	return packet;
+}
+
+// TCP-connect probe: a refused or timing-out connection means the server (and
+// possibly the machine) is down.
+function isServerReachable(baseUrl: string): Promise<boolean> {
+	const target = new URL(baseUrl);
+	const port = target.port ? Number(target.port) : target.protocol === "https:" ? 443 : 80;
+	return new Promise((resolve) => {
+		const socket = net.connect({ host: target.hostname, port });
+		const done = (ok: boolean) => {
+			socket.destroy();
+			resolve(ok);
+		};
+		socket.setTimeout(WAKE_PROBE_TIMEOUT_MS);
+		socket.once("connect", () => done(true));
+		socket.once("timeout", () => done(false));
+		socket.once("error", () => done(false));
+	});
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const ModelsResponseSchema = Type.Object({
 	models: Type.Optional(
@@ -209,6 +260,59 @@ export default async function (pi: ExtensionAPI) {
 
 	const baseUrl = (process.env.LLAMA_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
 	const apiKey = process.env.LLAMA_API_KEY ?? "no-key";
+
+	const wakeMac = (process.env.LLAMA_WAKE_MAC ?? "").trim();
+	const wakePacket = wakeMac ? buildMagicPacket(wakeMac) : null;
+	if (wakeMac && !wakePacket) {
+		console.warn(`[llama-cpp] ignoring invalid LLAMA_WAKE_MAC: ${wakeMac}`);
+	}
+
+	let wakeInFlight: Promise<void> | null = null;
+
+	// If the server is down, broadcast the magic packet and, when maxWaitMs > 0,
+	// block until it answers so a request sent right away does not fail while
+	// the box is still booting. Concurrent calls share one wake attempt.
+	async function wakeServerIfAsleep(
+		ctx: ExtensionCtx | undefined,
+		maxWaitMs: number,
+	): Promise<void> {
+		if (!wakePacket) {
+			return;
+		}
+		if (wakeInFlight) {
+			return wakeInFlight;
+		}
+		wakeInFlight = (async () => {
+			if (await isServerReachable(baseUrl)) {
+				return;
+			}
+			const socket = dgram.createSocket("udp4");
+			socket.setBroadcast(true);
+			socket.send(wakePacket, WAKE_PORT, WAKE_BROADCAST, () => socket.close());
+			notify(
+				ctx,
+				`[llama-cpp] server unreachable — sent wake-on-LAN packet${maxWaitMs > 0 ? ", waiting for it to boot" : ""}`,
+			);
+			const deadline = Date.now() + maxWaitMs;
+			while (Date.now() < deadline) {
+				await sleep(WAKE_POLL_INTERVAL_MS);
+				if (await isServerReachable(baseUrl)) {
+					notify(ctx, "[llama-cpp] server is up");
+					return;
+				}
+			}
+			if (maxWaitMs > 0) {
+				notify(
+					ctx,
+					`[llama-cpp] server still not reachable after ${Math.round(maxWaitMs / 1000)}s`,
+					"warning",
+				);
+			}
+		})().finally(() => {
+			wakeInFlight = null;
+		});
+		return wakeInFlight;
+	}
 
 	async function refreshProvider(): Promise<void> {
 		try {
@@ -639,6 +743,8 @@ export default async function (pi: ExtensionAPI) {
 		if (event.model.provider !== PROVIDER_ID) {
 			return;
 		}
+		// Start the wake early: a sleeping box needs time to boot.
+		void wakeServerIfAsleep(ctx, 0);
 		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
 	});
 
@@ -646,6 +752,9 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		try {
 			if (ctx.model?.provider === PROVIDER_ID) {
+				// Block until the server answers so the request does not fail
+				// while the box is still booting.
+				await wakeServerIfAsleep(ctx, WAKE_MAX_WAIT_MS);
 				await discoverModelMetadata(ctx.model.id, ctx, true, PROPS_TIMEOUT_MS, ctx.model);
 			}
 		} catch (error) {
