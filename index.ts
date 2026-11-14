@@ -8,7 +8,10 @@
  */
 
 import dgram from "node:dgram";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import net from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -16,6 +19,11 @@ import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:9931/v1";
+// Model cache file (agent dir, like pi's own models.json): the last-seen model
+// list, including the context sizes learned from /props, so the provider can
+// stay visible — marked offline — when the server is unreachable.
+const CACHE_FILE_NAME = "llama-cpp-models.json";
+const STATUS_SUFFIXES = [" (loaded)", " (offline)"];
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 32768;
 // llama.cpp has no output-token cap (no endpoint reports one; generation is only
@@ -219,6 +227,70 @@ function isStaleContextError(error: unknown): boolean {
 	return error instanceof Error && error.message.includes("stale after session replacement");
 }
 
+// Mirror pi's getAgentDir: PI_CODING_AGENT_DIR (tilde-expanded) or ~/.pi/agent.
+function agentDir(): string {
+	const envDir = (process.env.PI_CODING_AGENT_DIR ?? "").trim();
+	if (envDir) {
+		return envDir.startsWith("~") ? join(homedir(), envDir.slice(1)) : envDir;
+	}
+	return join(homedir(), ".pi", "agent");
+}
+
+function cachePath(): string {
+	return join(agentDir(), CACHE_FILE_NAME);
+}
+
+// " (loaded)" / " (offline)" are transient display state; the cache stores
+// names without them (" (image)" is a capability and stays).
+function stripStatusSuffix(name: string): string {
+	let out = name;
+	for (const suffix of STATUS_SUFFIXES) {
+		if (out.endsWith(suffix)) {
+			out = out.slice(0, -suffix.length);
+		}
+	}
+	return out;
+}
+
+function loadCachedModels(): LlamaModel[] | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(cachePath(), "utf8"));
+		if (!Array.isArray(parsed)) {
+			return null;
+		}
+		const models = parsed.filter(
+			(m): m is LlamaModel => typeof m?.id === "string" && typeof m?.name === "string",
+		);
+		if (models.length === 0) {
+			return null;
+		}
+		for (const m of models) {
+			m.name = stripStatusSuffix(m.name);
+			m.status = undefined;
+		}
+		return models;
+	} catch {
+		return null;
+	}
+}
+
+function saveCachedModels(models: LlamaModel[]): void {
+	try {
+		const entries = models.map((m) => ({
+			...m,
+			name: stripStatusSuffix(m.name),
+			status: undefined,
+		}));
+		mkdirSync(agentDir(), { recursive: true });
+		const tmp = `${cachePath()}.tmp`;
+		writeFileSync(tmp, JSON.stringify(entries));
+		renameSync(tmp, cachePath());
+	} catch (error) {
+		// The cache is a convenience, never a reason to fail a refresh.
+		console.warn(`[llama-cpp] model cache write failed: ${(error as Error).message}`);
+	}
+}
+
 // A captured ctx throws on any ui access once the session is replaced. Background
 // work (SSE stream, /props) outlives the session, so route its notifications
 // through here: a stale error means "session gone" and is swallowed, anything
@@ -275,8 +347,16 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("llama-refresh", {
 		description: "Re-query the llama.cpp server and refresh the model catalog",
 		handler: async (_args, ctx) => {
-			await refreshProvider();
-			ctx.ui.notify(`llama.cpp catalog re-queried — ${currentModels.length} model(s) available`);
+			const state = await refreshProvider();
+			// Both markers start with "llama.cpp catalog": non-TUI hosts (pi-web)
+			// re-request the catalog on that prefix, so the offline state must
+			// carry it too.
+			ctx.ui.notify(
+				state === "offline"
+					? `llama.cpp catalog offline — server unreachable, showing ${currentModels.length} cached model(s)`
+					: `llama.cpp catalog re-queried — ${currentModels.length} model(s) available`,
+				state === "offline" ? "warning" : undefined,
+			);
 		},
 	});
 
@@ -327,12 +407,14 @@ export default async function (pi: ExtensionAPI) {
 		return wakeInFlight;
 	}
 
-	async function refreshProvider(): Promise<void> {
+	// "live" — /v1/models answered; "offline" — server unreachable, catalog
+	// served from the model cache; "empty" — unreachable and nothing cached.
+	async function refreshProvider(): Promise<"live" | "offline" | "empty"> {
 		try {
 			const response = await fetch(`${baseUrl}/models`);
 			if (!response.ok) {
 				console.warn(`[llama-cpp] ${baseUrl}/models returned ${response.status}`);
-				return;
+				return "live";
 			}
 
 			const payload: unknown = await response.json();
@@ -341,7 +423,7 @@ export default async function (pi: ExtensionAPI) {
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
 				console.warn(`[llama-cpp] invalid /models response: ${errors}`);
-				return;
+				return "live";
 			}
 
 			const previousById = new Map(currentModels.map((m) => [m.id, m]));
@@ -397,7 +479,7 @@ export default async function (pi: ExtensionAPI) {
 
 			if (currentModels.length === 0) {
 				console.warn(`[llama-cpp] no models returned from ${baseUrl}/models`);
-				return;
+				return "live";
 			}
 
 			// Track which model is currently loaded on the server
@@ -411,8 +493,25 @@ export default async function (pi: ExtensionAPI) {
 				api: "openai-completions",
 				models: currentModels,
 			});
+			saveCachedModels(currentModels);
+			return "live";
 		} catch (error) {
 			console.warn(`[llama-cpp] failed to reach ${baseUrl}/models: ${(error as Error).message}`);
+			// Keep the provider visible from the last-seen models: selecting one
+			// still runs the wake-on-LAN / autoload path once the box is back.
+			const cached = loadCachedModels();
+			if (!cached) {
+				return "empty";
+			}
+			currentModels = cached.map((m) => ({ ...m, name: `${m.name} (offline)` }));
+			pi.registerProvider(PROVIDER_ID, {
+				name: "llama.cpp",
+				baseUrl,
+				apiKey,
+				api: "openai-completions",
+				models: currentModels,
+			});
+			return "offline";
 		}
 	}
 
@@ -727,6 +826,24 @@ export default async function (pi: ExtensionAPI) {
 				api: "openai-completions",
 				models: currentModels,
 			});
+			// /props just taught us the real context size — persist the learned
+			// values into the cache so the offline catalog (and the next child
+			// boot) keeps them. "model" may point at a pre-refresh array entry
+			// (refreshProvider above replaces currentModels), so merge by id.
+			saveCachedModels(
+				currentModels.map((m) =>
+					m.id === modelId
+						? {
+								...m,
+								contextWindow: model.contextWindow,
+								maxTokens: model.maxTokens,
+								reasoning: model.reasoning,
+								thinkingLevelMap: model.thinkingLevelMap,
+								compat: model.compat,
+							}
+						: m,
+				),
+			);
 		} catch (error) {
 			const err = error as Error;
 			// Suppress notification for aborted requests (model was switched) and for a
